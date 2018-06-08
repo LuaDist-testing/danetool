@@ -365,11 +365,6 @@ for i = 1, reply.n do
 			info("TLSA %s %s %s from DNS does not match:", tlsa_usages[tlsa.use],
 				tlsa_selectors[tlsa.select], tlsa_match_types[tlsa.match]);
 			print(tlsa);
-			info("To match the certificate, the record should look like:");
-			info(tlsa_mt.__tostring{
-				select = tlsa.select, use = tlsa.use, match = tlsa.match,
-				data_hex = assert(cert2tlsa(cert, tlsa.select, tlsa.match))
-			});
 		end
 	else
 		warn("Validating %s is not supported", tlsa_usages[tlsa.use]);
