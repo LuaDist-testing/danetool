@@ -3,7 +3,7 @@
 % 2015-12-12
 
 This is a tool that grabs a certificate from a service and compares it
-to a TLSA record.
+to TLSA records. It can also generate TLSA records.
 
 # Dependencies
 
@@ -17,19 +17,19 @@ to a TLSA record.
 
 # Usage
 
-## Just grab some cert from some HTTPS service
+## Check DANE on some HTTPS service
 
     danetool www.example.com
 
-## Grab cert from SMTP server
+## Check DANE on a SMTP server
 
     danetool --starttls=smtp mail.example.com:25
 
-## Grab cert and use SNI
+## Use a different name in SNI
 
     danetool myservice.example@hosting.example.net
 
-SNI support needs a recent LuaSec
+SNI support needs LuaSec.
 
 ## Generate a TLSA record
 
