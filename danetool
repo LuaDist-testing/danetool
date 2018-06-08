@@ -26,7 +26,6 @@ end
 -- Try to find a library with SHA2
 local function get_hashes()
 	-- Prosody installed? Use util.hashes
-	local old_cpath = package.cpath;
 	package.cpath = package.cpath .. ";/usr/lib/prosody/?.so"
 	local have_hashes, hashes = pcall(require, "util.hashes");
 	if have_hashes then return hashes end
@@ -112,11 +111,11 @@ setmetatable(tlsa_selectors, mt);
 setmetatable(tlsa_match_types, mt);
 
 function tlsa_mt:__tostring()
-	return ("%s %s %s %s"):format(
-		tlsa_usages[self.use] or self.use,
-		tlsa_selectors[self.select] or self.select,
-		tlsa_match_types[self.match] or self.match,
-		tohex(self.data));
+	return ("%d %d %d %s"):format(
+		self.use or self.use,
+		self.select or self.select,
+		self.match or self.match,
+		self.data_hex or tohex(self.data));
 end
 
 -- from mod_s2s_auth_dane
@@ -226,6 +225,7 @@ if not name then
 	info("    --pem               Output certificate in PEM format");
 	return
 end
+
 local target = name;
 local port = "443";
 if name:find("@") then
@@ -237,6 +237,10 @@ if name:find("@") then
 elseif name:find(":") then
 	name, port = name:match("^(.-):(.*)$");
 	target = name;
+end
+if not tonumber(port) then
+	erro("Invalid port %q", port);
+	os.exit(2);
 end
 
 info("Connecting to %s on port %d", target, port);
@@ -252,7 +256,7 @@ for _, arg in ipairs(arg) do
 			for preset in pairs(get_startts) do
 				info("  * %s", preset);
 			end
-			os.exit(1);
+			os.exit(2);
 		end
 		starttls = starttls(name, target);
 		-- io.stderr:write("Sending: ", starttls,  "\n\n");
@@ -303,24 +307,33 @@ end
 local match_found = false;
 for i = 1, reply.n do
 	local tlsa = parse_TLSA(reply[i]);
-	print();
-	print(tlsa)
 	if tlsa.use == 1 or tlsa.use == 3 then
+		info("");
 		local is_match, err = one_dane_check(tlsa, cert);
 		if is_match == nil then
-			warn("Unsupported "..err);
+			info("TLSA %s %s %s can't be verified: Unsupported %s",
+				tlsa_usages[tlsa.use], tlsa_selectors[tlsa.select],
+				tlsa_match_types[tlsa.match], err);
 			if not hashes then
 				info("Try installing one of Prosody, luaossl or luacrypto");
 			elseif tlsa.select == 1 and not cert.pubkey then
 				info("Try upgrading LuaSec to 0.6");
 			end
+			print(tlsa);
 		elseif is_match then
 			match_found = true;
-			print("Matches!");
+			info("TLSA %s %s %s matches:", tlsa_usages[tlsa.use],
+				tlsa_selectors[tlsa.select], tlsa_match_types[tlsa.match]);
+			print(tlsa)
 		else
-			info("Does not match, expected:");
-			info(tlsa.use .. " " .. tlsa.select .. " " .. tlsa.match .. " "
-			.. cert2tlsa(cert, tlsa.select, tlsa.match));
+			info("TLSA %s %s %s from DNS does not match:", tlsa_usages[tlsa.use],
+				tlsa_selectors[tlsa.select], tlsa_match_types[tlsa.match]);
+			print(tlsa);
+			info("To match the certificate, the record should look like:");
+			info(tlsa_mt.__tostring{
+				select = tlsa.select, use = tlsa.use, match = tlsa.match,
+				data_hex = assert(cert2tlsa(cert, tlsa.select, tlsa.match))
+			});
 		end
 	else
 		warn("Validating %s is not supported", tlsa_usages[tlsa.use]);
@@ -329,28 +342,32 @@ end
 
 for _, arg in ipairs(arg) do
 	local use, sel, match = arg:match("^%-%-gen%-tlsa=(%d)-(%d)%-(%d)$");
-	use, sel, match = tonumber(use), tonumber(sel), tonumber(match);
-	if use == 1 or use == 3 then
-		print();
-		local hexdata, err = cert2tlsa(cert, sel, match);
-		if not hexdata then
-			erro("Can't generate TLSA record :(");
-			erro("Unsupported "..err);
-			if not hashes then
-				info("Try installing one of Prosody, luaossl or luacrypto");
-			elseif sel == 1 and not cert.pubkey then
-				info("Try upgrading LuaSec");
+	if use then
+		use, sel, match = tonumber(use), tonumber(sel), tonumber(match);
+		if use == 1 or use == 3 then
+			print();
+			local hexdata, err = cert2tlsa(cert, sel, match);
+			if not hexdata then
+				erro("Can't generate TLSA record :(");
+				erro("Unsupported "..err);
+				if not hashes then
+					info("Try installing one of Prosody, luaossl or luacrypto");
+				elseif sel == 1 and not cert.pubkey then
+					info("Try upgrading LuaSec to 0.6");
+				end
+				break
 			end
-			break
+			info("Generating TLSA record:");
+			info("%s %s %s", tlsa_usages[use], tlsa_selectors[sel], tlsa_match_types[match]);
+			print(tlsa_mt.__tostring{
+				select = sel, use = use, match = match,
+				data_hex = assert(cert2tlsa(cert, sel, match))
+			});
+			break;
+		else
+			erro("Generating %s is not supported", tlsa_usages[use]);
 		end
-		info("Generating TLSA record:");
-		info("%s %s %s", tlsa_usages[use], tlsa_selectors[sel], tlsa_match_types[match]);
-		print(use .. " " .. sel .. " " .. match .. " "
-		.. cert2tlsa(cert, sel, match));
-		break;
-	else
-		erro("Generating %s is not supported", tlsa_usages[use]);
 	end
 end
 
-os.exit(match_found and 0 or 1);
+	os.exit(match_found and 0 or 1);

@@ -1,16 +1,16 @@
 -- This file was automatically generated for the LuaDist project.
 
 package = "danetool"
-version = "4-1"
+version = "5-1"
 -- LuaDist source
 source = {
-  tag = "4-1",
+  tag = "5-1",
   url = "git://github.com/LuaDist-testing/danetool.git"
 }
 -- Original source
 -- source = {
 -- 	url = "hg+http://code.zash.se/danetool/",
--- 	tag = "89e6b3a3523c"
+-- 	tag = "c03f658f0a60"
 -- }
 description = {
 	summary = "Tool for validating and generating TLSA records",
