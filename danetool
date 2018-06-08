@@ -5,6 +5,37 @@ local mime = require "mime";
 local ssl = require "ssl";
 local unbound = require "lunbound";
 
+local function parseargs(conf, args)
+	if not args[1] then return args end
+	local i = 1;
+	local parsed = {};
+
+	repeat
+		local arg = args[i];
+		local name, value = arg:match("^%-%-(.-)=(.*)$");
+		if not name then
+			name = arg:match("^%-%-(.*)$");
+		end
+		if name then
+			if not value then
+				if conf[name] then
+					value = args[i+1];
+					i = i + 2;
+				else
+					value = true;
+					i = i + 1;
+				end
+			end
+			parsed[name] = value;
+		else
+			table.insert(parsed, arg);
+			i = i + 1;
+		end
+	until args[i] == nil
+
+	return parsed;
+end
+
 local function info(message, ...)
 	io.stderr:write(message:format(...), "\n");
 end
@@ -215,8 +246,8 @@ local get_startts = {
 	-- TODO email etc
 }
 
-local name = table.remove(arg);
-if not name then
+local args = parseargs({ starttls = true, ["gen-tlsa"] = true }, arg);
+if #args ~= 1 then
 	info("%s (options) example.com[@service.example.net[:port]]", arg[0]:match("[^/\\]*$"));
 	info("  Options: (all optional)");
 	info("    --starttls=protocol Cleartext TLS negotiation");
@@ -226,6 +257,7 @@ if not name then
 	return
 end
 
+local name = args[1];
 local target = name;
 local port = "443";
 if name:find("@") then
@@ -246,26 +278,24 @@ end
 info("Connecting to %s on port %d", target, port);
 
 local sock = assert(socket.connect(target, port));
-for _, arg in ipairs(arg) do
-	local proto = arg:match("^%-%-starttls=(.*)");
-	if proto then
-		local starttls = get_startts[proto];
-		if not starttls then
-			erro("No starttls preset '%s'.", proto);
-			info("Available presets are:", proto);
-			for preset in pairs(get_startts) do
-				info("  * %s", preset);
-			end
-			os.exit(2);
+
+if args.starttls then
+	local starttls = get_startts[args.starttls];
+	if not starttls then
+		erro("No starttls preset '%s'.", proto);
+		info("Available presets are:", proto);
+		for preset in pairs(get_startts) do
+			info("  * %s", preset);
 		end
-		starttls = starttls(name, target);
-		-- io.stderr:write("Sending: ", starttls,  "\n\n");
-		sock:send(starttls);
-		sock:settimeout(1);
-		sock:receive("*a"); -- discard until asked to proceed with TLS
-		break
+		os.exit(2);
 	end
+	starttls = starttls(name, target);
+	-- io.stderr:write("Sending: ", starttls,  "\n\n");
+	sock:send(starttls);
+	sock:settimeout(1);
+	sock:receive("*a"); -- discard until asked to proceed with TLS
 end
+
 sock:settimeout(60);
 sock = ssl.wrap(sock, {
 	mode = "client",
@@ -277,11 +307,9 @@ end
 assert(sock:dohandshake());
 
 local cert = sock:getpeercertificate();
-for _, arg in ipairs(arg) do
-	if arg == "--pem" then
-		print(cert:pem());
-		break
-	end
+
+if args.pem then
+	print(cert:pem());
 end
 
 local resolver = unbound.new();
@@ -340,8 +368,8 @@ for i = 1, reply.n do
 	end
 end
 
-for _, arg in ipairs(arg) do
-	local use, sel, match = arg:match("^%-%-gen%-tlsa=(%d)-(%d)%-(%d)$");
+if args["gen-tlsa"] then
+	local use, sel, match = args["gen-tlsa"]:match("^(%d)-(%d)%-(%d)$");
 	if use then
 		use, sel, match = tonumber(use), tonumber(sel), tonumber(match);
 		if use == 1 or use == 3 then
@@ -355,19 +383,18 @@ for _, arg in ipairs(arg) do
 				elseif sel == 1 and not cert.pubkey then
 					info("Try upgrading LuaSec to 0.6");
 				end
-				break
+			else
+				info("Generating TLSA record:");
+				info("%s %s %s", tlsa_usages[use], tlsa_selectors[sel], tlsa_match_types[match]);
+				print(tlsa_mt.__tostring{
+					select = sel, use = use, match = match,
+					data_hex = assert(cert2tlsa(cert, sel, match))
+				});
 			end
-			info("Generating TLSA record:");
-			info("%s %s %s", tlsa_usages[use], tlsa_selectors[sel], tlsa_match_types[match]);
-			print(tlsa_mt.__tostring{
-				select = sel, use = use, match = match,
-				data_hex = assert(cert2tlsa(cert, sel, match))
-			});
-			break;
 		else
 			erro("Generating %s is not supported", tlsa_usages[use]);
 		end
 	end
 end
 
-	os.exit(match_found and 0 or 1);
+os.exit(match_found and 0 or 1);
