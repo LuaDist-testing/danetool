@@ -1,0 +1,62 @@
+% danetool
+% Kim Alvefur
+% 2015-12-12
+
+This is a tool that grabs a certificate from a service and compares it
+to a TLSA record.
+
+# Dependencies
+
+-   [LuaSocket](http://w3.impa.br/~diego/software/luasocket/)
+-   [LuaSec](https://github.com/brunoos/luasec) \>=0.5, with 0.6 needed for SPKI support
+-   [luaunbound](https://www.zash.se/luaunbound.html)
+-   Hash library, optional, but recommended for SPKI support
+    -   [Lua OpenSSL](http://25thandclement.com/~william/projects/luaossl.html)
+    -   LuaCrypto
+    -   `util.hashes` from [Prosody](https://prosody.im/)
+
+# Usage
+
+## Just grab some cert from some HTTPS service
+
+    danetool www.example.com
+
+## Grab cert from SMTP server
+
+    danetool --starttls=smtp mail.example.com:25
+
+## Grab cert and use SNI
+
+    danetool myservice.example@hosting.example.net
+
+SNI support needs a recent LuaSec
+
+## Generate a TLSA record
+
+    danetool --gen-tlsa=3-0-1 www.example.org
+
+Should give additional output like:
+
+    DANE-EE     Cert    SHA2-256
+    3 0 1 642de54d84c30494157f53f657bf9f89b4ea6c8b16351fd7ec258d556f821040
+
+## Options
+
+### `--starttls`
+
+Send some data before starting TLS handshake.
+
+Values (`--starttls=???`) are:
+
+-   `smtp`
+-   `imap`
+-   `xmpp-client`
+-   `xmpp-server`
+
+### `--gen-tlsa`
+
+Takes a tripplet of numeric Usage, Selector and Match parameters separated by hypen.
+
+### `--pem`
+
+Dumps the certificate in PEM format.

@@ -1,0 +1,356 @@
+#!/usr/bin/env lua5.1
+
+local socket = require "socket";
+local mime = require "mime";
+local ssl = require "ssl";
+local unbound = require "lunbound";
+
+local function info(message, ...)
+	io.stderr:write(message:format(...), "\n");
+end
+
+local function warn(message, ...)
+	return info("W: "..message, ...);
+end
+
+local function erro(message, ...)
+	return info("E: "..message, ...);
+end
+
+local function tohex(s)
+	return s:gsub(".", function (c)
+		return ("%02x"):format(c:byte());
+	end);
+end
+
+-- Try to find a library with SHA2
+local function get_hashes()
+	-- Prosody installed? Use util.hashes
+	local old_cpath = package.cpath;
+	package.cpath = package.cpath .. ";/usr/lib/prosody/?.so"
+	local have_hashes, hashes = pcall(require, "util.hashes");
+	if have_hashes then return hashes end
+	-- luaossl then?
+	local have_ossl, ossl_hash = pcall(require, "openssl.digest");
+	if have_ossl then
+		hashes = {};
+		function hashes.sha256(data, hex)
+			local hash = ossl_hash.new("sha256"):final(data);
+			if hex then return tohex(hash); end
+			return hash;
+		end
+		function hashes.sha512(data, hex)
+			local hash = ossl_hash.new("sha512"):final(data);
+			if hex then return tohex(hash); end
+			return hash;
+		end
+		return hashes;
+	end
+	-- No? But LuaCrypto?
+	local have_crypto, crypto = pcall(require, "crypto");
+	if not hashes and have_crypto then
+		hashes = {};
+		function hashes.sha256(data, hex)
+			return crypto.digest("sha256", data, not hex);
+		end
+		function hashes.sha512(data, hex)
+			return crypto.digest("sha512", data, not hex);
+		end
+		return hashes;
+	end
+	-- Oh well, at least LuaSec can return cert digests...
+end
+
+local hashes = get_hashes();
+
+-- from prosody util.x509
+local pat = "%-%-%-%-%-BEGIN ([A-Z ]+)%-%-%-%-%-\r?\n"..
+	"([0-9A-Za-z+/=\r\n]*)\r?\n%-%-%-%-%-END %1%-%-%-%-%-";
+
+local function pem2der(pem)
+	local typ, data = pem:match(pat);
+	if typ and data then
+		return mime.unb64(data), typ;
+	end
+end
+
+local tlsa_mt = {};
+
+-- from luaunbound util.dns
+local function parse_TLSA(packet)
+	local use, select, match = packet:byte(1,3);
+	return setmetatable({
+		use = use;
+		select = select;
+		match = match;
+		data = packet:sub(4);
+	}, tlsa_mt);
+end
+
+-- Acronyms from RFC 7218
+local tlsa_usages = {
+	[0] = "PKIX-CA(0)",
+	[1] = "PKIX-EE(1)",
+	[2] = "DANE-TA(2)",
+	[3] = "DANE-EE(3)",
+	[255] = "PrivCert(255)",
+};
+local tlsa_selectors = {
+	[0] = "Cert(0)",
+	[1] = "SPKI(1)",
+	[255] = "PrivSel(255)",
+};
+local tlsa_match_types = {
+	[0] = "Full(0)",
+	[1] = "SHA2-256(1)",
+	[2] = "SHA2-512(2)",
+	[255] = "PrivMatch(255)",
+};
+local mt = { __index = function (_, k) return k end };
+setmetatable(tlsa_usages, mt);
+setmetatable(tlsa_selectors, mt);
+setmetatable(tlsa_match_types, mt);
+
+function tlsa_mt:__tostring()
+	return ("%s %s %s %s"):format(
+		tlsa_usages[self.use] or self.use,
+		tlsa_selectors[self.select] or self.select,
+		tlsa_match_types[self.match] or self.match,
+		tohex(self.data));
+end
+
+-- from mod_s2s_auth_dane
+local function one_dane_check(tlsa, cert)
+	local select, match, certdata = tlsa.select, tlsa.match;
+
+	if select == 0 then
+		certdata = pem2der(cert:pem());
+	elseif select == 1 and cert.pubkey then
+		certdata = pem2der(cert:pubkey());
+	else
+		return nil, "selector " .. tlsa_selectors[select];
+	end
+
+	if match == 1 then
+		certdata = hashes.sha256(certdata);
+	elseif match == 2 then
+		certdata = hashes.sha512(certdata);
+	elseif match ~= 0 then
+		return nil, "match type " .. tlsa_match_types[match];
+	end
+	return certdata == tlsa.data;
+end
+
+local function cert2tlsa(cert, select, match)
+	local certdata;
+	if select == 0 then
+		certdata = pem2der(cert:pem());
+	elseif select == 1 and cert.pubkey then
+		certdata = pem2der(cert:pubkey());
+	else
+		return nil, "selector " .. tlsa_selectors[select];
+	end
+
+	if match == 1 then
+		certdata = hashes.sha256(certdata);
+	elseif match == 2 then
+		certdata = hashes.sha512(certdata);
+	elseif match ~= 0 then
+		return nil, "match type " .. tlsa_match_types[match];
+	end
+	return tohex(certdata);
+end
+
+if not hashes then
+	-- Fallback if no proper hash lib found
+	function one_dane_check(tlsa, cert)
+		local select, match = tlsa.select, tlsa.match;
+		if select ~= 0 then
+			return nil, "selector " .. tlsa_selectors[select];
+		end
+		if match == 1 then
+			return cert:digest("sha256") == tohex(tlsa.data);
+		elseif match == 2 then
+			return cert:digest("sha512") == tohex(tlsa.data);
+		elseif match == 0 then
+			return pem2der(cert:pem()) == tlsa.data;
+		end
+		return nil, "match type " .. tlsa_match_types[match];
+	end
+
+	function cert2tlsa(cert, select, match)
+		if select ~= 0 then
+			return nil, "selector " .. tlsa_selectors[select];
+		end
+		if match == 1 then
+			return cert:digest("sha256");
+		elseif match == 2 then
+			return cert:digest("sha512");
+		elseif match == 0 then
+			return tohex(pem2der(cert:pem()));
+		end
+		return nil, "match type " .. tlsa_match_types[match];
+	end
+end
+
+local starttls_blobs = {
+	xmpp = [[<stream:stream xmlns:stream='http://etherx.jabber.org/streams' to='$to' from='$from' version='1.0' xmlns='jabber:$type'><starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>]];
+}
+local get_startts = {
+	["xmpp-client"] = function (name)
+		return starttls_blobs.xmpp:gsub("$(%w+)", {
+			type = "client", from = "", to = name;
+		});
+	end;
+	["xmpp-server"] = function (name)
+		return starttls_blobs.xmpp:gsub("$(%w+)", {
+			type = "server", from = "example.com", to = name;
+		});
+	end;
+	smtp = function ()
+		return "STARTTLS\r\n";
+	end;
+	imap = function ()
+		return "1 STARTTLS\n";
+	end;
+	-- TODO email etc
+}
+
+local name = table.remove(arg);
+if not name then
+	info("%s (options) example.com[@service.example.net[:port]]", arg[0]:match("[^/\\]*$"));
+	info("  Options: (all optional)");
+	info("    --starttls=protocol Cleartext TLS negotiation");
+	info("               ( xmpp-client | xmpp-server | smtp | imap )");
+	info("    --gen-tlsa=U-S-M    Generate TLSA records from numeric paramaters");
+	info("    --pem               Output certificate in PEM format");
+	return
+end
+local target = name;
+local port = "443";
+if name:find("@") then
+	if name:find(":") then
+		name, target, port = name:match("^(.-)@(.-):(.*)$");
+	else
+		name, target = name:match("^(.-)@(.*)$");
+	end
+elseif name:find(":") then
+	name, port = name:match("^(.-):(.*)$");
+	target = name;
+end
+
+info("Connecting to %s on port %d", target, port);
+
+local sock = assert(socket.connect(target, port));
+for _, arg in ipairs(arg) do
+	local proto = arg:match("^%-%-starttls=(.*)");
+	if proto then
+		local starttls = get_startts[proto];
+		if not starttls then
+			erro("No starttls preset '%s'.", proto);
+			info("Available presets are:", proto);
+			for preset in pairs(get_startts) do
+				info("  * %s", preset);
+			end
+			os.exit(1);
+		end
+		starttls = starttls(name, target);
+		-- io.stderr:write("Sending: ", starttls,  "\n\n");
+		sock:send(starttls);
+		sock:settimeout(1);
+		sock:receive("*a"); -- discard until asked to proceed with TLS
+		break
+	end
+end
+sock:settimeout(60);
+sock = ssl.wrap(sock, {
+	mode = "client",
+	protocol = "tlsv1_2",
+});
+if sock.sni then
+	sock:sni(name);
+end
+assert(sock:dohandshake());
+
+local cert = sock:getpeercertificate();
+for _, arg in ipairs(arg) do
+	if arg == "--pem" then
+		print(cert:pem());
+		break
+	end
+end
+
+local resolver = unbound.new();
+local reply = assert(resolver:resolve(("_%d._tcp.%s."):format(port, target), 52, 1));
+
+if reply.nxdomain then
+	info("Query for %s returned NXDOMAIN", reply.qname);
+elseif reply.n == 0 then
+	info("Query for %s returned an empty response", reply.qname);
+else
+	info("Query for %s returned %d TLSA record%s", reply.qname, reply.n, reply.n ~= 1 and "s" or "");
+end
+
+if reply.bogus then
+	warn("Reply was bogus:");
+	warn(reply.bogus);
+elseif not reply.secure then
+	info("Reply is insecure");
+else
+	info("Reply is secure");
+end
+
+local match_found = false;
+for i = 1, reply.n do
+	local tlsa = parse_TLSA(reply[i]);
+	print();
+	print(tlsa)
+	if tlsa.use == 1 or tlsa.use == 3 then
+		local is_match, err = one_dane_check(tlsa, cert);
+		if is_match == nil then
+			warn("Unsupported "..err);
+			if not hashes then
+				info("Try installing one of Prosody, luaossl or luacrypto");
+			elseif tlsa.select == 1 and not cert.pubkey then
+				info("Try upgrading LuaSec to 0.6");
+			end
+		elseif is_match then
+			match_found = true;
+			print("Matches!");
+		else
+			info("Does not match, expected:");
+			info(tlsa.use .. " " .. tlsa.select .. " " .. tlsa.match .. " "
+			.. cert2tlsa(cert, tlsa.select, tlsa.match));
+		end
+	else
+		warn("Validating %s is not supported", tlsa_usages[tlsa.use]);
+	end
+end
+
+for _, arg in ipairs(arg) do
+	local use, sel, match = arg:match("^%-%-gen%-tlsa=(%d)-(%d)%-(%d)$");
+	use, sel, match = tonumber(use), tonumber(sel), tonumber(match);
+	if use == 1 or use == 3 then
+		print();
+		local hexdata, err = cert2tlsa(cert, sel, match);
+		if not hexdata then
+			erro("Can't generate TLSA record :(");
+			erro("Unsupported "..err);
+			if not hashes then
+				info("Try installing one of Prosody, luaossl or luacrypto");
+			elseif sel == 1 and not cert.pubkey then
+				info("Try upgrading LuaSec");
+			end
+			break
+		end
+		info("Generating TLSA record:");
+		info("%s %s %s", tlsa_usages[use], tlsa_selectors[sel], tlsa_match_types[match]);
+		print(use .. " " .. sel .. " " .. match .. " "
+		.. cert2tlsa(cert, sel, match));
+		break;
+	else
+		erro("Generating %s is not supported", tlsa_usages[use]);
+	end
+end
+
+os.exit(match_found and 0 or 1);
